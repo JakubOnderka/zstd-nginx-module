@@ -46,8 +46,6 @@ typedef struct {
 
     ZSTD_CStream                *cstream;
 
-    ngx_http_request_t          *request;
-
     size_t                       bytes_in;
     size_t                       bytes_out;
 
@@ -57,6 +55,7 @@ typedef struct {
     unsigned                     flush:1;
     unsigned                     done:1;
     unsigned                     nomem:1;
+    unsigned                     cached:1;
 } ngx_http_zstd_ctx_t;
 
 
@@ -70,6 +69,9 @@ static ngx_http_output_body_filter_pt  ngx_http_next_body_filter;
 
 static ngx_str_t  ngx_http_zstd_ratio = ngx_string("zstd_ratio");
 
+static ZSTD_CStream  *ngx_http_zstd_cached_cstream;
+static ngx_uint_t     ngx_http_zstd_cached_cstream_busy;
+
 
 static ngx_int_t ngx_http_zstd_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_zstd_body_filter(ngx_http_request_t *r,
@@ -80,6 +82,10 @@ static ngx_int_t ngx_http_zstd_filter_get_buf(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx);
 static ZSTD_CStream *ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx);
+static ngx_int_t ngx_http_zstd_filter_release_cstream(ngx_http_zstd_ctx_t *ctx,
+    ngx_log_t *log, ngx_uint_t discard);
+static void ngx_http_zstd_filter_cleanup(void *data);
+static void ngx_http_zstd_filter_exit_process(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_zstd_filter_compress(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx);
 static ngx_int_t ngx_http_zstd_accept_encoding(ngx_str_t *ae);
@@ -91,8 +97,6 @@ static char *ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent,
 static ngx_int_t ngx_http_zstd_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
-static void * ngx_http_zstd_filter_alloc(void *opaque, size_t size);
-static void ngx_http_zstd_filter_free(void *opaque, void *address);
 static char *ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data);
 static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 
@@ -169,7 +173,7 @@ ngx_module_t  ngx_http_zstd_filter_module = {
     NULL,                                   /* init process */
     NULL,                                   /* init thread */
     NULL,                                   /* exit thread */
-    NULL,                                   /* exit process */
+    ngx_http_zstd_filter_exit_process,      /* exit process */
     NULL,                                   /* exit master */
     NGX_MODULE_V1_PADDING
 };
@@ -179,6 +183,7 @@ static ngx_int_t
 ngx_http_zstd_header_filter(ngx_http_request_t *r)
 {
     ngx_table_elt_t           *h;
+    ngx_pool_cleanup_t        *cln;
     ngx_http_zstd_loc_conf_t  *zlcf;
     ngx_http_zstd_ctx_t       *ctx;
 
@@ -209,9 +214,15 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 
-    ngx_http_set_ctx(r, ctx, ngx_http_zstd_filter_module);
+    cln = ngx_pool_cleanup_add(r->pool, 0);
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
 
-    ctx->request = r;
+    cln->handler = ngx_http_zstd_filter_cleanup;
+    cln->data = ctx;
+
+    ngx_http_set_ctx(r, ctx, ngx_http_zstd_filter_module);
     ctx->last_out = &ctx->out;
 
     h = ngx_list_push(&r->headers_out.headers);
@@ -237,7 +248,6 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    size_t                rv;
     ngx_int_t             flush, rc;
     ngx_chain_t          *cl;
     ngx_http_zstd_ctx_t  *ctx;
@@ -344,12 +354,9 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         flush = 0;
 
         if (ctx->done) {
-            rv = ZSTD_freeCStream(ctx->cstream);
-            if (ZSTD_isError(rv)) {
-                ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                              "ZSTD_freeCStream() failed: %s",
-                              ZSTD_getErrorName(rv));
-
+            if (ngx_http_zstd_filter_release_cstream(ctx, r->connection->log,
+                                                     0) != NGX_OK)
+            {
                 rc = NGX_ERROR;
             }
 
@@ -360,11 +367,7 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 failed:
 
     ctx->done = 1;
-    rv = ZSTD_freeCStream(ctx->cstream);
-    if (ZSTD_isError(rv)) {
-        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                      "ZSTD_freeCStream() failed: %s", ZSTD_getErrorName(rv));
-    }
+    (void) ngx_http_zstd_filter_release_cstream(ctx, r->connection->log, 1);
 
     return NGX_ERROR;
 }
@@ -586,22 +589,41 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
 {
     size_t                      rc;
     ZSTD_CStream               *cstream;
-    ZSTD_customMem              cmem;
     ngx_http_zstd_loc_conf_t   *zlcf;
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
-    cmem.customAlloc = ngx_http_zstd_filter_alloc;
-    cmem.customFree = ngx_http_zstd_filter_free;
-    cmem.opaque = ctx;
-
-    cstream = ZSTD_createCStream_advanced(cmem);
-    if (cstream == NULL) {
-        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                      "ZSTD_createCStream_advanced() failed");
-
-        return NULL;
+    if (!ngx_http_zstd_cached_cstream_busy) {
+        ngx_http_zstd_cached_cstream_busy = 1;
+        ctx->cached = 1;
+        cstream = ngx_http_zstd_cached_cstream;
+        if (cstream != NULL) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "zstd: reusing worker cstream");
+        }
+    } else {
+        cstream = NULL;
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "zstd: worker cstream busy");
     }
+
+    if (cstream == NULL) {
+        cstream = ZSTD_createCStream();
+        if (cstream == NULL) {
+            if (ctx->cached) {
+                ngx_http_zstd_cached_cstream_busy = 0;
+                ctx->cached = 0;
+            }
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                          "ZSTD_createCStream() failed");
+            return NULL;
+        }
+        if (ctx->cached) {
+            ngx_http_zstd_cached_cstream = cstream;
+        }
+    }
+
+    ctx->cstream = cstream;
 
     rc = ZSTD_initCStream(cstream, zlcf->level);
     if (ZSTD_isError(rc)) {
@@ -615,12 +637,7 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
     return cstream;
 
 failed:
-    rc = ZSTD_freeCStream(cstream);
-    if (ZSTD_isError(rc)) {
-        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                      "ZSTD_freeCStream() failed: %s", ZSTD_getErrorName(rc));
-    }
-
+    (void) ngx_http_zstd_filter_release_cstream(ctx, r->connection->log, 1);
     return NULL;
 }
 
@@ -743,19 +760,69 @@ ngx_http_zstd_filter_init(ngx_conf_t *cf)
 }
 
 
-static void *
-ngx_http_zstd_filter_alloc(void *opaque, size_t size)
+static ngx_int_t
+ngx_http_zstd_filter_release_cstream(ngx_http_zstd_ctx_t *ctx, ngx_log_t *log,
+    ngx_uint_t discard)
 {
-    ngx_http_zstd_ctx_t *ctx = opaque;
+    size_t  rc;
 
-    void  *p;
+    if (ctx->cstream == NULL) {
+        return NGX_OK;
+    }
 
-    p = ngx_palloc(ctx->request->pool, size);
+    if (ctx->cached && !discard) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "zstd: returned worker cstream");
+        ngx_http_zstd_cached_cstream_busy = 0;
+        ctx->cstream = NULL;
+        ctx->cached = 0;
+        return NGX_OK;
+    }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
-                   "zstd alloc: %p, size: %uz", p, size);
+    if (ctx->cached) {
+        ngx_http_zstd_cached_cstream = NULL;
+        ngx_http_zstd_cached_cstream_busy = 0;
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "zstd: discarded worker cstream");
+    }
 
-    return p;
+    rc = ZSTD_freeCStream(ctx->cstream);
+    ctx->cstream = NULL;
+    ctx->cached = 0;
+    if (ZSTD_isError(rc)) {
+        ngx_log_error(NGX_LOG_ALERT, log, 0,
+                      "ZSTD_freeCStream() failed: %s", ZSTD_getErrorName(rc));
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_zstd_filter_cleanup(void *data)
+{
+    ngx_http_zstd_ctx_t  *ctx = data;
+
+    (void) ngx_http_zstd_filter_release_cstream(ctx, ngx_cycle->log, 1);
+}
+
+
+static void
+ngx_http_zstd_filter_exit_process(ngx_cycle_t *cycle)
+{
+    size_t  rc;
+
+    if (ngx_http_zstd_cached_cstream == NULL) {
+        return;
+    }
+
+    rc = ZSTD_freeCStream(ngx_http_zstd_cached_cstream);
+    ngx_http_zstd_cached_cstream = NULL;
+    ngx_http_zstd_cached_cstream_busy = 0;
+    if (ZSTD_isError(rc)) {
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "ZSTD_freeCStream() failed: %s", ZSTD_getErrorName(rc));
+    }
 }
 
 
@@ -804,20 +871,6 @@ ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
     vv->no_cacheable = 1;
 
     return NGX_OK;
-}
-
-
-static void
-ngx_http_zstd_filter_free(void *opaque, void *address)
-{
-#if (NGX_DEBUG)
-
-    ngx_http_zstd_ctx_t *ctx = opaque;
-
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
-                   "zstd free: %p", address);
-
-#endif
 }
 
 
