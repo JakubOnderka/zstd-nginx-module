@@ -36,7 +36,7 @@ jobs:
       - name: Build nginx
         working-directory: ${{ runner.temp }}/nginx
         run: |
-          ./auto/configure --add-module="$GITHUB_WORKSPACE" --with-cc-opt="$ASAN_CFLAGS -DNGX_DEBUG_PALLOC=1" --with-ld-opt="$ASAN_LDFLAGS"
+          ./auto/configure --with-debug --add-module="$GITHUB_WORKSPACE" --with-cc-opt="$ASAN_CFLAGS -DNGX_DEBUG_PALLOC=1" --with-ld-opt="$ASAN_LDFLAGS"
           make -j"$(nproc)"
       - name: Run tests
         env:
