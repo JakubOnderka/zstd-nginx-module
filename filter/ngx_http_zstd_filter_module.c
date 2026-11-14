@@ -428,13 +428,11 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     action = ZSTD_e_continue;
 
     /* Drain input first to preserve streaming compression parameters. */
-    if (ctx->buffer_in.pos == ctx->buffer_in.size) {
-        if (ctx->last) {
-            action = ZSTD_e_end;
+    if (ctx->last && ctx->in == NULL) {
+        action = ZSTD_e_end;
 
-        } else if (ctx->flush) {
-            action = ZSTD_e_flush;
-        }
+    } else if (ctx->buffer_in.pos == ctx->buffer_in.size && ctx->flush) {
+        action = ZSTD_e_flush;
     }
 
     input = ctx->buffer_in;
