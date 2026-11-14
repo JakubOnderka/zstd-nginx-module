@@ -17,11 +17,6 @@
 
 
 typedef struct {
-    ngx_str_t                    dict_file;
-} ngx_http_zstd_main_conf_t;
-
-
-typedef struct {
     ngx_flag_t                   enable;
     ngx_int_t                    level;
     ssize_t                      min_length;
@@ -32,7 +27,6 @@ typedef struct {
 
     ngx_array_t                 *types_keys;
 
-    ZSTD_CDict                  *dict;
 } ngx_http_zstd_loc_conf_t;
 
 
@@ -91,8 +85,6 @@ static ngx_int_t ngx_http_zstd_filter_compress(ngx_http_request_t *r,
 static ngx_int_t ngx_http_zstd_accept_encoding(ngx_str_t *ae);
 static ngx_int_t ngx_http_zstd_ok(ngx_http_request_t *r);
 static ngx_int_t ngx_http_zstd_filter_init(ngx_conf_t *cf);
-static void * ngx_http_zstd_create_main_conf(ngx_conf_t *cf);
-static char *ngx_http_zstd_init_main_conf(ngx_conf_t *cf, void *conf);
 static void *ngx_http_zstd_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -148,13 +140,6 @@ static ngx_command_t  ngx_http_zstd_filter_commands[] = {
       offsetof(ngx_http_zstd_loc_conf_t, min_length),
       NULL },
 
-    { ngx_string("zstd_dict_file"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_str_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_zstd_main_conf_t, dict_file),
-      NULL },
-
     ngx_null_command
 };
 
@@ -163,8 +148,8 @@ static ngx_http_module_t  ngx_http_zstd_filter_module_ctx = {
     ngx_http_zstd_add_variables,            /* preconfiguration */
     ngx_http_zstd_filter_init,              /* postconfiguration */
 
-    ngx_http_zstd_create_main_conf,         /* create main configuration */
-    ngx_http_zstd_init_main_conf,           /* init main configuration */
+    NULL,                                   /* create main configuration */
+    NULL,                                   /* init main configuration */
 
     NULL,                                   /* create server configuration */
     NULL,                                   /* merge server configuration */
@@ -600,45 +585,13 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
         return NULL;
     }
 
-    /* TODO use the advanced initialize functions */
+    rc = ZSTD_initCStream(cstream, zlcf->level);
+    if (ZSTD_isError(rc)) {
+        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                      "ZSTD_initCStream() failed: %s",
+                      ZSTD_getErrorName(rc));
 
-    if (zlcf->dict) {
-#if ZSTD_VERSION_NUMBER >= 10500
-        rc = ZSTD_CCtx_reset(cstream, ZSTD_reset_session_only);
-        if (ZSTD_isError(rc)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_CCtx_reset() failed: %s",
-                          ZSTD_getErrorName(rc));
-            goto failed;
-        }
-
-        rc = ZSTD_CCtx_refCDict(cstream, zlcf->dict);
-        if (ZSTD_isError(rc)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_CCtx_refCDict() failed: %s",
-                          ZSTD_getErrorName(rc));
-            goto failed;
-        }
-#else
-        rc = ZSTD_initCStream_usingCDict(cstream, zlcf->dict);
-#endif
-        if (ZSTD_isError(rc)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_initCStream_usingCDict() failed: %s",
-                          ZSTD_getErrorName(rc));
-
-            goto failed;
-        }
-
-    } else {
-        rc = ZSTD_initCStream(cstream, zlcf->level);
-        if (ZSTD_isError(rc)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_initCStream() failed: %s",
-                          ZSTD_getErrorName(rc));
-
-            goto failed;
-        }
+        goto failed;
     }
 
     return cstream;
@@ -710,37 +663,6 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
 
 
 static void *
-ngx_http_zstd_create_main_conf(ngx_conf_t *cf)
-{
-    ngx_http_zstd_main_conf_t  *zmcf;
-
-    zmcf = ngx_pcalloc(cf->pool, sizeof(ngx_http_zstd_main_conf_t));
-    if (zmcf == NULL) {
-        return NULL;
-    }
-
-    return zmcf;
-}
-
-
-static char *
-ngx_http_zstd_init_main_conf(ngx_conf_t *cf, void *conf)
-{
-    ngx_http_zstd_main_conf_t *zmcf = conf;
-
-    if (zmcf->dict_file.len == 0) {
-        return NGX_CONF_OK;
-    }
-
-    if (ngx_conf_full_name(cf->cycle, &zmcf->dict_file, 1) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-    return NGX_CONF_OK;
-}
-
-
-static void *
 ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
 {
     ngx_http_zstd_loc_conf_t  *conf;
@@ -756,7 +678,6 @@ ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
      *    conf->bufs.num = 0;
      *    conf->types = { NULL };
      *    conf->types_keys = NULL;
-     *    conf->dict = NULL;
      */
 
     conf->enable = NGX_CONF_UNSET;
@@ -773,18 +694,6 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_zstd_loc_conf_t *prev = parent;
     ngx_http_zstd_loc_conf_t *conf = child;
 
-    ngx_fd_t                    fd;
-    size_t                      size;
-    ssize_t                     n;
-    char                       *rc;
-    u_char                     *buf;
-    ngx_file_info_t             info;
-    ngx_http_zstd_main_conf_t  *zmcf;
-
-    rc = NGX_OK;
-    buf = NULL;
-    fd = NGX_INVALID_FILE;
-
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->level, prev->level, 1);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
@@ -796,89 +705,10 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
-    ngx_conf_merge_ptr_value(conf->dict, prev->dict, NULL);
     ngx_conf_merge_bufs_value(conf->bufs, prev->bufs,
                               (128 * 1024) / ngx_pagesize, ngx_pagesize);
 
-    zmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_zstd_filter_module);
-
-    if (conf->enable && zmcf->dict_file.len > 0) {
-
-        if (conf->level == prev->level) {
-            conf->dict = prev->dict;
-
-        } else {
-            /*
-             * compression level is different from the outer block,
-             * so we should create a seperate dict object.
-             */
-
-            fd = ngx_open_file(zmcf->dict_file.data, NGX_FILE_RDONLY,
-                               NGX_FILE_OPEN, 0);
-
-            if (fd == NGX_INVALID_FILE) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                                   ngx_open_file_n " \"%V\" failed",
-                                   &zmcf->dict_file);
-
-                return NGX_CONF_ERROR;
-            }
-
-            if (ngx_fd_info(fd, &info) == NGX_FILE_ERROR) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                                   ngx_fd_info_n " \"%V\" failed",
-                                   &zmcf->dict_file);
-
-                rc = NGX_CONF_ERROR;
-                goto close;
-            }
-
-            size = ngx_file_size(&info);
-            buf = ngx_palloc(cf->pool, size);
-            if (buf == NULL) {
-                rc = NGX_CONF_ERROR;
-                goto close;
-            }
-
-            n = ngx_read_fd(fd, (void *) buf, size);
-            if (n < 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                                   ngx_read_fd_n " %V\" failed",
-                                   &zmcf->dict_file);
-
-                rc = NGX_CONF_ERROR;
-                goto close;
-
-            } else if ((size_t) n != size) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                                   ngx_read_fd_n "\"%V incomplete\"",
-                                   &zmcf->dict_file);
-
-                rc = NGX_CONF_ERROR;
-                goto close;
-            }
-
-            conf->dict = ZSTD_createCDict_byReference(buf, size, conf->level);
-            if (conf->dict == NULL) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "ZSTD_createCDict_byReference() failed");
-                rc = NGX_CONF_ERROR;
-                goto close;
-            }
-        }
-    }
-
-close:
-
-    if (fd != NGX_INVALID_FILE && ngx_close_file(fd) == NGX_FILE_ERROR) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
-                           ngx_close_file_n " \"%V\" failed",
-                           &zmcf->dict_file);
-
-        rc = NGX_CONF_ERROR;
-    }
-
-    return rc;
+    return NGX_CONF_OK;
 }
 
 
