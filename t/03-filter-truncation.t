@@ -7,7 +7,7 @@ use Test::More;
 use Digest::SHA qw/sha256 sha256_hex/;
 use Test::Nginx qw/ :DEFAULT http_content /;
 
-my $t = Test::Nginx->new()->has(qw/http/)->plan(28);
+my $t = Test::Nginx->new()->has(qw/http/)->plan(33);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 %%TEST_GLOBALS%%
@@ -46,6 +46,7 @@ $t->run();
 
 for my $case ((map { ["single/$_.bin", substr($content, 0, $_)] } @sizes),
 	['single/repeat.bin', 'a' x 300000],
+	['multi/repeat.bin', 'a' x 300000],
 	['multi/300000.bin', substr($content, 0, 300000)])
 {
 	my ($uri, $expected) = @$case;
@@ -59,6 +60,10 @@ for my $case ((map { ["single/$_.bin", substr($content, 0, $_)] } @sizes),
 	}
 	my ($headers) = split /\r\n\r\n/, $r, 2;
 	like($headers, qr/^Content-Encoding: zstd\r?$/mi, "$uri: compressed response");
+	if ($uri eq 'multi/repeat.bin') {
+		cmp_ok(length(http_content($r)), '<', 64,
+			'fragmented response is not flushed at each input buffer');
+	}
 	my $dir = $t->testdir;
 	$t->write_file('response.zst', http_content($r));
 	my $status = system('zstd', '-q', '-d', '-f', "$dir/response.zst",

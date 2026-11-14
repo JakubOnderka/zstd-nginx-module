@@ -378,6 +378,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 {
     size_t        rc, pos_in, pos_out;
     char         *hint;
+    ngx_uint_t    action, finished;
     ngx_chain_t  *cl;
     ngx_buf_t    *b;
 
@@ -390,8 +391,10 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 
     pos_in = ctx->buffer_in.pos;
     pos_out = ctx->buffer_out.pos;
+    action = ctx->action;
+    finished = 0;
 
-    switch (ctx->action) {
+    switch (action) {
 
     case NGX_HTTP_ZSTD_FILTER_FLUSH:
         hint = "ZSTD_flushStream() ";
@@ -424,34 +427,34 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
                    ctx->buffer_out.size);
 
-    ctx->in_buf->pos += ctx->buffer_in.pos - pos_in;
+    if (ctx->buffer_in.pos != pos_in) {
+        ctx->in_buf->pos += ctx->buffer_in.pos - pos_in;
+    }
     ctx->out_buf->last += ctx->buffer_out.pos - pos_out;
     ctx->redo = 0;
 
-    if (rc > 0) {
-        if (ctx->action == NGX_HTTP_ZSTD_FILTER_COMPRESS) {
-            ctx->action = NGX_HTTP_ZSTD_FILTER_FLUSH;
+    if (action == NGX_HTTP_ZSTD_FILTER_COMPRESS) {
+        /* compressStream returns an input-size hint, not pending output. */
+        if (ctx->buffer_in.pos < ctx->buffer_in.size) {
+            ctx->redo = 1;
+
+        } else if (ctx->last || ctx->flush) {
+            ctx->action = ctx->last ? NGX_HTTP_ZSTD_FILTER_END
+                                    : NGX_HTTP_ZSTD_FILTER_FLUSH;
+            ctx->redo = 1;
         }
 
+    } else if (rc != 0) {
         ctx->redo = 1;
 
-    } else if (ctx->last && ctx->action != NGX_HTTP_ZSTD_FILTER_END
-               && ctx->buffer_in.pos == ctx->buffer_in.size)
-    {
-        ctx->redo = 1;
-        ctx->action = NGX_HTTP_ZSTD_FILTER_END;
-
-        /* pending to call the ZSTD_endStream() */
-
-        return NGX_AGAIN;
-
-    } else if (ctx->action != NGX_HTTP_ZSTD_FILTER_END) {
-        ctx->action = NGX_HTTP_ZSTD_FILTER_COMPRESS; /* restore */
+    } else {
+        finished = 1;
+        ctx->action = NGX_HTTP_ZSTD_FILTER_COMPRESS;
     }
 
     /* A completed flush must be forwarded even if it produced no bytes. */
 
-    if (ngx_buf_size(ctx->out_buf) == 0 && (rc != 0 || !ctx->flush)) {
+    if (ngx_buf_size(ctx->out_buf) == 0 && !finished) {
         return NGX_AGAIN;
     }
 
@@ -469,16 +472,11 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         }
     }
 
-    /* A flush is not EOF while the last input buffer is still being drained. */
-
-    if (rc == 0
-        && (ctx->flush
-            || (ctx->last && ctx->action == NGX_HTTP_ZSTD_FILTER_END)))
-    {
+    if (finished) {
         r->connection->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
 
         b->flush = ctx->flush;
-        b->last_buf = ctx->last && ctx->action == NGX_HTTP_ZSTD_FILTER_END;
+        b->last_buf = action == NGX_HTTP_ZSTD_FILTER_END;
 
         ctx->done = b->last_buf;
         ctx->flush = 0;
@@ -521,12 +519,8 @@ ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     ctx->in_buf = ctx->in->buf;
     ctx->in = ctx->in->next;
 
-    if (ctx->in_buf->flush) {
-        ctx->flush = 1;
-
-    } else if (ctx->in_buf->last_buf) {
-        ctx->last = 1;
-    }
+    ctx->flush = ctx->in_buf->flush;
+    ctx->last = ctx->in_buf->last_buf;
 
     ctx->buffer_in.src = ctx->in_buf->pos;
     ctx->buffer_in.pos = 0;
