@@ -30,7 +30,7 @@ jobs:
       - name: Build nginx
         working-directory: ${{ runner.temp }}/nginx
         run: |
-          ./auto/configure --add-module="$GITHUB_WORKSPACE"
+          ./auto/configure --with-debug --add-module="$GITHUB_WORKSPACE"
           make -j"$(nproc)"
       - name: Run tests
         env:
