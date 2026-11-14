@@ -9,7 +9,6 @@ zstd-nginx-module - Nginx module for the [Zstandard compression](https://faceboo
 * [Installation](#installation)
 * [Directives](#directives)
   * [ngx_http_zstd_filter_module](#ngx_http_zstd_filter_module)
-    * [zstd_dict_file](#zstd_dict_file)
     * [zstd](#zstd)
     * [zstd_comp_level](#zstd_comp_level)
     * [zstd_min_length](#zstd_min_length)
@@ -29,9 +28,6 @@ This Nginx module is currently considered experimental. Issues and PRs are welco
 # Synopsis
 
 ```nginx
-
-# specify the dictionary
-zstd_dict_file /path/to/dict;
 
 server {
     listen 127.0.0.1:8080;
@@ -67,21 +63,26 @@ To use theses modules, configure your nginx branch with `--add-module=/path/to/z
 * System's zstd bundle will be linked if `ZSTD_INC` and `ZSTD_LIB` are not specified.
 * Both `ngx_http_zstd_static_module` and `ngx_http_zstd_filter_module` will be configured.
 
+The filter does not support compression dictionaries. Existing configurations
+must remove the `zstd_dict_file` directive.
+
+# Testing
+
+The tests use the [nginx test suite](https://github.com/nginx/nginx-tests)
+and the `zstd` command-line tool. Build nginx with this module, then run:
+
+```sh
+PERL5LIB=/path/to/nginx-tests/lib \
+TEST_NGINX_BINARY=/path/to/nginx/objs/nginx prove -v t/*.t
+```
+
+CI selects the newest release from the latest nginx stable branch.
+
 # Directives
 
 ## ngx_http_zstd_filter_module
 
 The `ngx_http_zstd_filter_module` module is a filter that compresses responses using the _"zstd"_ method. This often helps to reduce the size of transmitted data by half or even more.
-
-### zstd_dict_file
-
-**Syntax:** *zstd_dict_file /path/to/dict;*  
-**Default:** *-*  
-**Context:** *http*  
-
-Specifies the external dictionary.
-
-**WARNING:** Be careful! The content-coding registration only specifies a means to signal the use of the zstd format, and does not additionally specify any mechanism for advertising/negotiating/synchronizing the use of a specific dictionary between client and server. Use the `zstd_dict_file` only if you can insure that both ends _(server and client)_ are capable of using the same dictionary (e.g. advertise with a HTTP header). See https://github.com/tokers/zstd-nginx-module/issues/2 for the details.
 
 ### zstd
 
