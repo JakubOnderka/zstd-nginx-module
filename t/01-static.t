@@ -1,198 +1,67 @@
-use Test::Nginx::Socket;
-use lib 'lib';
+#!/usr/bin/perl
 
-no_long_string();
-log_level 'debug';
-repeat_each(3);
-plan tests => repeat_each() * ((blocks() - 3) * 5 + 3);
-run_tests();
+use warnings;
+use strict;
 
+use Test::More;
+use Test::Nginx qw/ :DEFAULT http_content /;
 
-__DATA__
+my $t = Test::Nginx->new()->has(qw/http/)->plan(10);
 
-
-=== TEST 1: zstd_static off
---- config
-    location /test {
-        zstd_static off;
-        root ../../t/suite;
+$t->write_file_expand('nginx.conf', <<'EOF');
+%%TEST_GLOBALS%%
+daemon off;
+events {}
+http {
+    %%TEST_GLOBALS_HTTP%%
+    server {
+        listen 127.0.0.1:8080;
+        root %%TESTDIR%%;
+        location /on/ { zstd_static on; }
+        location /always/ { zstd_static always; }
+        location /off/ { zstd_static off; }
     }
---- request
-GET /test
---- response_headers
-Content-Length: 59738
-ETag: "5be17d33-e95a"
-!Content-Encoding
---- no_error_log
-[error]
+}
+EOF
 
+my $content = 'static content ' x 100;
+for my $path ('on', 'always', 'off') {
+	mkdir $t->testdir . "/$path" or die "mkdir $path: $!";
+	$t->write_file("$path/data.txt", $content);
+	my $dir = $t->testdir;
+	system('zstd', '-q', '-f', "$dir/$path/data.txt", '-o', "$dir/$path/data.txt.zst") == 0
+		or die "zstd compression failed";
+}
+$t->run();
 
+my $r = request('/on/data.txt', 'zstd');
+like($r, qr/^Content-Encoding: zstd\r?$/mi, 'static on with zstd');
+$t->write_file('response.zst', http_content($r));
+my $dir = $t->testdir;
+system('zstd', '-q', '-d', '-f', "$dir/response.zst", '-o', "$dir/response.out") == 0
+	or die "zstd decompression failed";
+open my $fh, '<', "$dir/response.out" or die "open decompressed file: $!";
+is(do { local $/; <$fh> }, $content, 'static response decompresses');
 
-=== TEST 2: zstd_static off (with accept-encoding header)
---- config
-    location /test {
-        zstd_static off;
-        root ../../t/suite;
-    }
---- request
-GET /test
-Accept-Encoding: gzip,zstd
---- response_headers
-Content-Length: 59738
-ETag: "5be17d33-e95a"
-!Content-Encoding
---- no_error_log
-[error]
+$r = request('/on/data.txt', undef);
+unlike($r, qr/^Content-Encoding:/mi, 'static on without accept encoding');
+is(http_content($r), $content, 'static on returns original');
 
+$r = request('/on/data.txt', 'gzip');
+unlike($r, qr/^Content-Encoding:/mi, 'static on with gzip only');
 
+$r = request('/always/data.txt', undef);
+like($r, qr/^Content-Encoding: zstd\r?$/mi, 'static always without accept encoding');
 
-=== TEST 3: zstd_static on
---- config
-    location /test {
-        zstd_static on;
-        root ../../t/suite;
-    }
---- request
-GET /test
---- more_headers
-Accept-Encoding: gzip, zstd
---- response_headers
-Content-Length: 20706
-ETag: "5be17d33-50e2"
-!Content-Encoding
-Content-Encoding: zstd
---- no_error_log
-[error]
+$r = request('/off/data.txt', 'zstd');
+unlike($r, qr/^Content-Encoding:/mi, 'static off');
+is(http_content($r), $content, 'static off returns original');
 
+like(request('/on/missing.txt', 'zstd'), qr/^HTTP\/1\.[01] 404 /, 'missing file');
+like(request('/always/missing.txt', undef), qr/^HTTP\/1\.[01] 404 /, 'missing file with always');
 
-
-=== TEST 4: zstd_static on (without accept-encoding header)
---- config
-    location /test {
-        zstd_static on;
-        root ../../t/suite;
-    }
---- request
-GET /test
---- response_headers
-Content-Length: 59738
-ETag: "5be17d33-e95a"
-Content-Encoding: zstd
-!Content-Encoding
---- no_error_log
-[error]
-
-
-
-=== TEST 5: zstd_static on (without zstd component in accept-encoding header)
---- config
-    location /test {
-        zstd_static on;
-        root ../../t/suite;
-    }
---- request
-GET /test
---- more_headers
-Accept-Encoding: gzip, br
---- response_headers
-Content-Length: 59738
-ETag: "5be17d33-e95a"
-!Content-Encoding
---- no_error_log
-[error]
-
-
-
-=== TEST 6: zstd_static always
---- config
-    location /test {
-        zstd_static always;
-        root ../../t/suite;
-    }
---- request
-GET /test
---- more_headers
-Accept-Encoding: gzip, br
---- response_headers
-Content-Length: 20706
-ETag: "5be17d33-50e2"
-Content-Encoding: zstd
---- no_error_log
-[error]
-
-
-
-=== TEST 6: zstd_static always (without accept-encoding header)
---- config
-    location /test {
-        zstd_static always;
-        root ../../t/suite;
-    }
---- request
-GET /test
---- response_headers
-Content-Length: 20706
-ETag: "5be17d33-50e2"
-Content-Encoding: zstd
---- no_error_log
-[error]
-
-
-
-=== TEST 7: zstd_static always (without zstd component in accept-encoding header)
---- config
-    location /test {
-        zstd_static always;
-        root ../../t/suite;
-    }
---- request
-GET /test
---- more_headers
-Accept-Encoding: gzip, br
---- response_headers
-Content-Length: 20706
-ETag: "5be17d33-50e2"
-Content-Encoding: zstd
---- no_error_log
-[error]
-
-
-=== TEST 8: zstd_static always (file does not exist)
---- config
-    location /test2 {
-        zstd_static always;
-        root ../../t/suite;
-    }
---- request
-GET /test2
---- more_headers
-Accept-Encoding: gzip, br
---- error_code: 404
-
-
-
-=== TEST 9: zstd_static on (file does not exist)
---- config
-    location /test2 {
-        zstd_static on;
-        root ../../t/suite;
-    }
---- request
-GET /test2
---- more_headers
-Accept-Encoding: gzip, br
---- error_code: 404
-
-
-
-=== TEST 10: zstd_static off (file does not exist)
---- config
-    location /test2 {
-        zstd_static off;
-        root ../../t/suite;
-    }
---- request
-GET /test2
---- more_headers
-Accept-Encoding: gzip, br
---- error_code: 404
+sub request {
+	my ($uri, $encoding) = @_;
+	my $header = defined $encoding ? "Accept-Encoding: $encoding\r\n" : '';
+	return http("GET $uri HTTP/1.0\r\nHost: localhost\r\n${header}\r\n");
+}
