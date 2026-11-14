@@ -43,12 +43,15 @@ typedef struct {
 
     size_t                       bytes_in;
     size_t                       bytes_out;
+    size_t                       consumed;
+    size_t                       limit;
 
     unsigned                     last:1;
     unsigned                     flush:1;
     unsigned                     done:1;
     unsigned                     nomem:1;
     unsigned                     cached:1;
+    unsigned                     yield:1;
 } ngx_http_zstd_ctx_t;
 
 
@@ -242,9 +245,10 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    ngx_int_t             flush, rc;
-    ngx_chain_t          *cl;
-    ngx_http_zstd_ctx_t  *ctx;
+    ngx_int_t                  flush, rc, output;
+    ngx_chain_t               *cl;
+    ngx_http_zstd_ctx_t       *ctx;
+    ngx_http_core_loc_conf_t  *clcf;
 
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_zstd_filter_module);
@@ -270,6 +274,17 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         r->connection->buffered |= NGX_HTTP_GZIP_BUFFERED;
     }
+
+    if (ctx->yield) {
+        if (r->connection->write->posted) {
+            return NGX_AGAIN;
+        }
+
+        ctx->yield = 0;
+        ctx->limit = ctx->consumed;
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
     if (ctx->nomem) {
 
@@ -323,15 +338,20 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 goto failed;
             }
 
-            if (rc == NGX_OK) {
+            if (rc == NGX_OK
+                || (clcf->sendfile_max_chunk
+                    && ctx->consumed - ctx->limit
+                       >= clcf->sendfile_max_chunk))
+            {
                 break;
             }
 
             /* rc == NGX_AGAIN */
         }
 
-        if (ctx->out == NULL && !flush) {
-            return ctx->busy ? NGX_AGAIN : NGX_OK;
+        output = ctx->out != NULL || flush;
+        if (!output) {
+            goto yield;
         }
 
         rc = ngx_http_next_body_filter(r, ctx->out);
@@ -356,6 +376,24 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
             return rc;
         }
+
+    yield:
+
+        /* Bound CPU work even when compressed output never blocks. */
+        if (clcf->sendfile_max_chunk
+            && ctx->consumed - ctx->limit >= clcf->sendfile_max_chunk
+            && r->connection->write->ready
+            && !r->connection->write->delayed)
+        {
+            ctx->yield = 1;
+            r->connection->buffered |= NGX_HTTP_GZIP_BUFFERED;
+            ngx_post_event(r->connection->write, &ngx_posted_next_events);
+            return NGX_AGAIN;
+        }
+
+        if (!output) {
+            return ctx->busy ? NGX_AGAIN : NGX_OK;
+        }
     }
 
 failed:
@@ -370,11 +408,13 @@ failed:
 static ngx_int_t
 ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 {
-    size_t             rc, pos_in, pos_out;
-    ZSTD_EndDirective  action;
-    ngx_uint_t         finished;
-    ngx_chain_t       *cl;
-    ngx_buf_t         *b;
+    size_t                     rc, pos_in, pos_out, budget;
+    ZSTD_EndDirective          action;
+    ZSTD_inBuffer              input;
+    ngx_uint_t                 finished;
+    ngx_chain_t               *cl;
+    ngx_buf_t                 *b;
+    ngx_http_core_loc_conf_t  *clcf;
 
     ngx_log_debug7(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "zstd compress in: src:%p pos:%ud size: %ud, "
@@ -397,8 +437,22 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         }
     }
 
-    rc = ZSTD_compressStream2(ctx->cstream, &ctx->buffer_out,
-                             &ctx->buffer_in, action);
+    input = ctx->buffer_in;
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    if (action == ZSTD_e_continue && clcf->sendfile_max_chunk) {
+        budget = clcf->sendfile_max_chunk
+                 - ngx_min(ctx->consumed - ctx->limit,
+                           clcf->sendfile_max_chunk);
+        /* A blocked downstream may postpone the yield. */
+        if (budget == 0) {
+            budget = clcf->sendfile_max_chunk;
+            ctx->limit = ctx->consumed;
+        }
+        input.size = input.pos + ngx_min(input.size - input.pos, budget);
+    }
+
+    rc = ZSTD_compressStream2(ctx->cstream, &ctx->buffer_out, &input, action);
+    ctx->buffer_in.pos = input.pos;
 
     if (ZSTD_isError(rc)) {
         ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
@@ -418,6 +472,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     if (ctx->buffer_in.pos != pos_in) {
         ctx->in_buf->pos += ctx->buffer_in.pos - pos_in;
     }
+    ctx->consumed += ctx->buffer_in.pos - pos_in;
     ctx->out_buf->last += ctx->buffer_out.pos - pos_out;
     finished = action != ZSTD_e_continue && rc == 0;
 
