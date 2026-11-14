@@ -7,7 +7,7 @@ use Test::More;
 use Digest::SHA qw/sha256 sha256_hex/;
 use Test::Nginx qw/ :DEFAULT http_content /;
 
-my $t = Test::Nginx->new()->has(qw/http/)->plan(33);
+my $t = Test::Nginx->new()->has(qw/http/)->plan(49);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 %%TEST_GLOBALS%%
@@ -20,6 +20,7 @@ http {
         listen 127.0.0.1:8080;
         default_type application/octet-stream;
         zstd on;
+        zstd_min_length 0;
         zstd_types application/octet-stream;
         zstd_buffers 8 1k;
         sendfile off;
@@ -37,7 +38,7 @@ EOF
 
 # Force output backpressure while a last_buf still has unconsumed input.
 my $content = join '', map { sha256(pack('N', $_)) } 1..46875;
-my @sizes = (131071, 131072, 131073, 300000, 1500000);
+my @sizes = (0, 1, 1024, 1025, 131071, 131072, 131073, 300000, 1500000);
 for my $size (@sizes) {
 	$t->write_file("$size.bin", substr($content, 0, $size));
 }

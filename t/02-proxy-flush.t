@@ -4,16 +4,20 @@ use warnings;
 use strict;
 
 use Test::More;
+use Digest::SHA qw/sha256/;
 use IO::Socket::INET;
 use Test::Nginx qw/ :DEFAULT http_content /;
 
 # A short upstream body must not trap the filter on an empty flush buffer.
 # https://github.com/tokers/zstd-nginx-module/pull/23
 
-plan tests => 26;
+plan tests => 38;
+
+my $entropy = join '', map { sha256(pack('N', $_)) } 1..2048;
 
 for my $case (['on', 'truncated'], ['on', 'chunked'],
-	['off', 'truncated'], ['off', 'chunked'])
+	['off', 'truncated'], ['off', 'chunked'],
+	['on', 'entropy'], ['off', 'entropy'])
 {
 	my ($buffering, $kind) = @$case;
 	my $t = Test::Nginx->new()->has(qw/http proxy/);
@@ -28,6 +32,7 @@ http {
         listen 127.0.0.1:8080;
         zstd on;
         zstd_min_length 0;
+        zstd_buffers 2 1k;
         zstd_types application/json;
         location / {
             proxy_pass http://127.0.0.1:8081;
@@ -55,7 +60,8 @@ EOF
 		ok(defined $r && $r !~ /\r\n0\r\n\r\n\z/,
 			"$name: incomplete response has no final HTTP chunk");
 	} elsif (defined $r) {
-		is(decompress($t, $r), 'a' x 32768 . 'b' x 32768,
+		is(decompress($t, $r),
+			$kind eq 'entropy' ? $entropy : 'a' x 32768 . 'b' x 32768,
 			"$name: response decompresses");
 	} else {
 		fail("$name: response decompresses");
@@ -110,11 +116,14 @@ sub upstream {
 			print $client "HTTP/1.1 200 OK\r\n"
 				. "Content-Type: application/json\r\n"
 				. "Content-Length: 2\r\nConnection: close\r\n\r\na";
-		} elsif ($request =~ m{^GET /chunked }) {
+		} elsif ($request =~ m{^GET /(chunked|entropy) }) {
+			my @chunks = $1 eq 'entropy'
+				? (substr($entropy, 0, 32768), substr($entropy, 32768))
+				: ('a' x 32768, 'b' x 32768);
 			print $client "HTTP/1.1 200 OK\r\n"
 				. "Content-Type: application/json\r\n"
 				. "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
-			for my $chunk ('a' x 32768, 'b' x 32768) {
+			for my $chunk (@chunks) {
 				print $client sprintf("%x\r\n", length $chunk), $chunk, "\r\n";
 				select undef, undef, undef, 0.1;
 			}
