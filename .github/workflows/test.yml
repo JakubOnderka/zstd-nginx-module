@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  nginx-stable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpcre2-dev libzstd-dev zlib1g-dev zstd
+      - name: Get latest stable nginx and test suite
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stable=$(gh api --paginate 'repos/nginx/nginx/branches?per_page=100' \
+            --jq '.[].name' | grep -E '^stable-[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          version=${stable#stable-}
+          tag=$(gh api --paginate 'repos/nginx/nginx/tags?per_page=100' \
+            --jq '.[].name' | grep -E "^release-${version//./\\.}\\.[0-9]+$" | sort -V | tail -1)
+          echo "Testing nginx $tag"
+          git clone --depth 1 --branch "$tag" https://github.com/nginx/nginx.git "$RUNNER_TEMP/nginx"
+          git clone --depth 1 https://github.com/nginx/nginx-tests.git "$RUNNER_TEMP/nginx-tests"
+      - name: Build nginx
+        working-directory: ${{ runner.temp }}/nginx
+        run: |
+          ./auto/configure --add-module="$GITHUB_WORKSPACE"
+          make -j $(nproc)
+      - name: Run tests
+        env:
+          PERL5LIB: ${{ runner.temp }}/nginx-tests/lib
+          TEST_NGINX_BINARY: ${{ runner.temp }}/nginx/objs/nginx
+        run: prove -v t/*.t
