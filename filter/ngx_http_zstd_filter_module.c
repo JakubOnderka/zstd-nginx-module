@@ -11,11 +11,6 @@
 #include <zstd.h>
 
 
-#define NGX_HTTP_ZSTD_FILTER_COMPRESS       0
-#define NGX_HTTP_ZSTD_FILTER_FLUSH          1
-#define NGX_HTTP_ZSTD_FILTER_END            2
-
-
 typedef struct {
     ngx_flag_t                   enable;
     ngx_int_t                    level;
@@ -49,9 +44,7 @@ typedef struct {
     size_t                       bytes_in;
     size_t                       bytes_out;
 
-    unsigned                     action:2;
     unsigned                     last:1;
-    unsigned                     redo:1;
     unsigned                     flush:1;
     unsigned                     done:1;
     unsigned                     nomem:1;
@@ -377,46 +370,40 @@ failed:
 static ngx_int_t
 ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 {
-    size_t        rc, pos_in, pos_out;
-    char         *hint;
-    ngx_uint_t    action, finished;
-    ngx_chain_t  *cl;
-    ngx_buf_t    *b;
+    size_t             rc, pos_in, pos_out;
+    ZSTD_EndDirective  action;
+    ngx_uint_t         finished;
+    ngx_chain_t       *cl;
+    ngx_buf_t         *b;
 
-    ngx_log_debug8(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+    ngx_log_debug7(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "zstd compress in: src:%p pos:%ud size: %ud, "
-                   "dst:%p pos:%ud size:%ud flush:%d redo:%d",
+                   "dst:%p pos:%ud size:%ud flush:%d",
                    ctx->buffer_in.src, ctx->buffer_in.pos, ctx->buffer_in.size,
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
-                   ctx->buffer_out.size, ctx->flush, ctx->redo);
+                   ctx->buffer_out.size, ctx->flush);
 
     pos_in = ctx->buffer_in.pos;
     pos_out = ctx->buffer_out.pos;
-    action = ctx->action;
-    finished = 0;
+    action = ZSTD_e_continue;
 
-    switch (action) {
+    /* Drain input first to preserve streaming compression parameters. */
+    if (ctx->buffer_in.pos == ctx->buffer_in.size) {
+        if (ctx->last) {
+            action = ZSTD_e_end;
 
-    case NGX_HTTP_ZSTD_FILTER_FLUSH:
-        hint = "ZSTD_flushStream() ";
-        rc = ZSTD_flushStream(ctx->cstream, &ctx->buffer_out);
-        break;
-
-    case NGX_HTTP_ZSTD_FILTER_END:
-        hint = "ZSTD_endStream() ";
-        rc = ZSTD_endStream(ctx->cstream, &ctx->buffer_out);
-        break;
-
-    default:
-        hint = "ZSTD_compressStream() ";
-        rc = ZSTD_compressStream(ctx->cstream, &ctx->buffer_out,
-                                 &ctx->buffer_in);
-        break;
+        } else if (ctx->flush) {
+            action = ZSTD_e_flush;
+        }
     }
+
+    rc = ZSTD_compressStream2(ctx->cstream, &ctx->buffer_out,
+                             &ctx->buffer_in, action);
 
     if (ZSTD_isError(rc)) {
         ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                      "%s failed: %s", hint, ZSTD_getErrorName(rc));
+                      "ZSTD_compressStream2() failed: %s",
+                      ZSTD_getErrorName(rc));
 
         return NGX_ERROR;
     }
@@ -432,26 +419,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         ctx->in_buf->pos += ctx->buffer_in.pos - pos_in;
     }
     ctx->out_buf->last += ctx->buffer_out.pos - pos_out;
-    ctx->redo = 0;
-
-    if (action == NGX_HTTP_ZSTD_FILTER_COMPRESS) {
-        /* compressStream returns an input-size hint, not pending output. */
-        if (ctx->buffer_in.pos < ctx->buffer_in.size) {
-            ctx->redo = 1;
-
-        } else if (ctx->last || ctx->flush) {
-            ctx->action = ctx->last ? NGX_HTTP_ZSTD_FILTER_END
-                                    : NGX_HTTP_ZSTD_FILTER_FLUSH;
-            ctx->redo = 1;
-        }
-
-    } else if (rc != 0) {
-        ctx->redo = 1;
-
-    } else {
-        finished = 1;
-        ctx->action = NGX_HTTP_ZSTD_FILTER_COMPRESS;
-    }
+    finished = action != ZSTD_e_continue && rc == 0;
 
     /* A completed flush must be forwarded even if it produced no bytes. */
 
@@ -477,7 +445,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         r->connection->buffered &= ~NGX_HTTP_GZIP_BUFFERED;
 
         b->flush = ctx->flush;
-        b->last_buf = action == NGX_HTTP_ZSTD_FILTER_END;
+        b->last_buf = action == ZSTD_e_end;
 
         ctx->done = b->last_buf;
         ctx->flush = 0;
@@ -504,8 +472,7 @@ ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 {
     if (ctx->buffer_in.pos < ctx->buffer_in.size
         || ctx->flush
-        || ctx->last
-        || ctx->redo)
+        || ctx->last)
     {
         return NGX_OK;
     }

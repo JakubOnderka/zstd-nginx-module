@@ -4,10 +4,13 @@ use warnings;
 use strict;
 
 use Test::More;
+use IO::Select;
 use IO::Socket::INET;
+use IPC::Open3;
+use Symbol qw/gensym/;
 use Test::Nginx qw/ :DEFAULT http_start http_end http_content /;
 
-my $t = Test::Nginx->new()->has(qw/http proxy debug/)->plan(18);
+my $t = Test::Nginx->new()->has(qw/http proxy debug/)->plan(20);
 
 $t->write_file_expand('nginx.conf', <<'EOF');
 %%TEST_GLOBALS%%
@@ -54,13 +57,34 @@ is(http_content(request('/level1/body.html')), http_content($first),
 	'compression level reset after reuse');
 
 my $slow = start_slow($t);
+my $partial = '';
+my $readable = IO::Select->new($slow);
+while ($readable->can_read(1)) {
+	my $n = sysread($slow, my $chunk, 65536);
+	last if !defined $n || !$n;
+	$partial .= $chunk;
+	last if $partial =~ /\r\n\r\n.+/s && !$readable->can_read(0.1);
+}
+my ($partial_frame) = $partial =~ /\r\n\r\n(.*)/s;
+ok(defined $partial_frame && length $partial_frame,
+	'proxy flush sends compressed data before upstream completes');
+$t->write_file('partial.zst', $partial_frame // '');
+my $err = gensym;
+my $pid = open3(my $stdin, my $stdout, $err, 'zstd', '-q', '-d', '-c',
+	$t->testdir . '/partial.zst');
+close $stdin;
+my $decoded = do { local $/; <$stdout> } // '';
+my $error = do { local $/; <$err> };
+waitpid($pid, 0);
+ok(length($decoded) && $decoded eq substr($payload, 0, length($decoded)),
+	'flushed data is decodable before upstream completes');
 my $busy = count_log($t, 'zstd: worker cstream busy');
 is(decompress($t, request('/level1/body.html')), $payload,
 	'overlapping response decodes');
 ok(wait_log($t, 'zstd: worker cstream busy', $busy),
 	'overlap uses separate context');
 $t->write_file('resume', 'go');
-is(decompress($t, http_end($slow)), $payload, 'slow response decodes');
+is(decompress($t, $partial . http_end($slow)), $payload, 'slow response decodes');
 
 unlink $t->testdir . '/resume' or die "remove resume: $!";
 $slow = start_slow($t);
