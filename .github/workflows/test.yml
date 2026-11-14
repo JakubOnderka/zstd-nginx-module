@@ -31,7 +31,7 @@ jobs:
         working-directory: ${{ runner.temp }}/nginx
         run: |
           ./auto/configure --add-module="$GITHUB_WORKSPACE"
-          make -j $(nproc)
+          make -j"$(nproc)"
       - name: Run tests
         env:
           PERL5LIB: ${{ runner.temp }}/nginx-tests/lib
