@@ -658,6 +658,27 @@ failed:
 
 
 static ngx_int_t
+ngx_http_zstd_accept_encoding_ends_with_zstd(ngx_str_t *ae)
+{
+    static const u_char  suffix[] = ", zstd";
+    size_t               suffix_len;
+
+    suffix_len = sizeof(suffix) - 1; /* 6 */
+
+    if (ae->len < suffix_len) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_strncmp(ae->data + (ae->len - suffix_len),
+                    suffix, suffix_len) == 0) {
+        return NGX_OK;
+    }
+
+    return NGX_DECLINED;
+}
+
+
+static ngx_int_t
 ngx_http_zstd_accept_encoding(ngx_str_t *ae)
 {
     u_char  *p;
@@ -699,7 +720,8 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    if (ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK) {
+    if (ngx_http_zstd_accept_encoding_ends_with_zstd(&ae->value) != NGX_OK &&
+        ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK) {
         return NGX_DECLINED;
     }
 
