@@ -194,8 +194,8 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
            && r->headers_out.content_encoding->value.len)
        || (r->headers_out.content_length_n != -1
            && r->headers_out.content_length_n < zlcf->min_length)
-       || ngx_http_test_content_type(r, &zlcf->types) == NULL
-       || r->header_only)
+       || r->header_only
+       || ngx_http_test_content_type(r, &zlcf->types) == NULL)
     {
         return ngx_http_next_header_filter(r);
     }
