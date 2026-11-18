@@ -698,12 +698,9 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    if (ngx_memcmp(ae->value.data, "zstd", 4) != 0
-        && ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK)
-    {
+    if (ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK) {
         return NGX_DECLINED;
     }
-
 
     r->gzip_tested = 1;
     r->gzip_ok = 0;
